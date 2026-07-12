@@ -54,7 +54,7 @@ mod tests {
 
     fn sample_object(id: u64) -> Object {
         let r = 6778.0;
-        let v = (crate::simulation::propagate::MU_EARTH / r).sqrt();
+        let v = (crate::simulation::constants::MU_EARTH / r).sqrt();
         Object::new(
             id,
             Vector3::new(r, 0.0, 0.0),

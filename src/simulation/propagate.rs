@@ -8,8 +8,7 @@
 
 use nalgebra::Vector3;
 
-/// Earth's standard gravitational parameter, GM (km^3/s^2).
-pub const MU_EARTH: f64 = 398_600.4418;
+use crate::simulation::constants::MU_EARTH;
 
 /// Convergence tolerance and iteration cap for the universal Kepler solve.
 const KEPLER_TOL: f64 = 1e-9;
