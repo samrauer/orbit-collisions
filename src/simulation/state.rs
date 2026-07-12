@@ -1,3 +1,6 @@
+use nalgebra::Vector3;
+
+use crate::simulation::collision::{DetectionReport, detect_collisions};
 use crate::simulation::object::Object;
 
 /// Holds the state of every active debris object / satellite in the
@@ -43,6 +46,16 @@ impl SimulationState {
         for object in &mut self.objects {
             object.propagate(dt);
         }
+    }
+
+    /// Advance every object by `dt` seconds and detect any collisions or close
+    /// approaches that occurred during the step, using the pre- and post-step
+    /// positions to catch pass-throughs the discrete states would miss.
+    pub fn step_and_detect(&mut self, dt: f64) -> DetectionReport {
+        let previous_positions: Vec<Vector3<f64>> =
+            self.objects.iter().map(|o| o.pos).collect();
+        self.propagate(dt);
+        detect_collisions(&self.objects, &previous_positions)
     }
 }
 
