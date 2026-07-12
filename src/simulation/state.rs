@@ -1,10 +1,10 @@
-use satkit::TLE;
+use crate::simulation::object::Object;
 
 /// Holds the state of every active debris object / satellite in the
 /// simulation.
 #[derive(Clone, Debug, Default)]
 pub struct SimulationState {
-    objects: Vec<TLE>,
+    objects: Vec<Object>,
 }
 
 impl SimulationState {
@@ -12,20 +12,14 @@ impl SimulationState {
         Self::default()
     }
 
-    /// Build a state from a set of TLE lines (2- or 3-line, mixed is fine).
-    pub fn from_lines(lines: &[String]) -> satkit::tle::Result<Self> {
-        let tles = TLE::from_lines(lines)?;
-        Ok(Self::from_tles(tles))
-    }
-
-    pub fn from_tles(tles: impl IntoIterator<Item = TLE>) -> Self {
+    pub fn from_objects(objects: impl IntoIterator<Item = Object>) -> Self {
         Self {
-            objects: tles.into_iter().collect(),
+            objects: objects.into_iter().collect(),
         }
     }
 
-    pub fn push(&mut self, tle: TLE) {
-        self.objects.push(tle);
+    pub fn push(&mut self, object: Object) {
+        self.objects.push(object);
     }
 
     pub fn len(&self) -> usize {
@@ -36,25 +30,39 @@ impl SimulationState {
         self.objects.is_empty()
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &TLE> {
+    pub fn iter(&self) -> impl Iterator<Item = &Object> {
         self.objects.iter()
     }
 
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut TLE> {
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Object> {
         self.objects.iter_mut()
+    }
+
+    /// Advance every object forward by `dt` seconds under two-body motion.
+    pub fn propagate(&mut self, dt: f64) {
+        for object in &mut self.objects {
+            object.propagate(dt);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::simulation::object::ObjectKind;
+    use nalgebra::Vector3;
 
-    fn sample_lines() -> Vec<String> {
-        vec![
-            "0 INTELSAT 902".to_string(),
-            "1 26900U 01039A   06106.74503247  .00000045  00000-0  10000-3 0  8290".to_string(),
-            "2 26900   0.0164 266.5378 0003319  86.1794 182.2590  1.00273847 16981".to_string(),
-        ]
+    fn sample_object(id: u64) -> Object {
+        let r = 6778.0;
+        let v = (crate::simulation::propagate::MU_EARTH / r).sqrt();
+        Object::new(
+            id,
+            Vector3::new(r, 0.0, 0.0),
+            Vector3::new(0.0, v, 0.0),
+            0.005,
+            100.0,
+            ObjectKind::Intact,
+        )
     }
 
     #[test]
@@ -65,27 +73,25 @@ mod tests {
     }
 
     #[test]
-    fn from_lines_parses_tle() {
-        let state = SimulationState::from_lines(&sample_lines()).unwrap();
-        assert_eq!(state.len(), 1);
-        assert_eq!(state.iter().next().unwrap().sat_num, 26900);
+    fn from_objects_collects() {
+        let state = SimulationState::from_objects([sample_object(1), sample_object(2)]);
+        assert_eq!(state.len(), 2);
     }
 
     #[test]
     fn push_adds_object() {
         let mut state = SimulationState::new();
-        let tle = TLE::from_lines(&sample_lines()).unwrap().remove(0);
-        state.push(tle);
+        state.push(sample_object(1));
         assert_eq!(state.len(), 1);
         assert!(!state.is_empty());
     }
 
     #[test]
-    fn iter_mut_allows_modification() {
-        let mut state = SimulationState::from_lines(&sample_lines()).unwrap();
-        for tle in state.iter_mut() {
-            tle.sat_num = 1;
-        }
-        assert_eq!(state.iter().next().unwrap().sat_num, 1);
+    fn propagate_moves_objects() {
+        let mut state = SimulationState::from_objects([sample_object(1)]);
+        let before = state.iter().next().unwrap().pos;
+        state.propagate(60.0);
+        let after = state.iter().next().unwrap().pos;
+        assert!((after - before).norm() > 0.0);
     }
 }
