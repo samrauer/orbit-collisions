@@ -15,6 +15,35 @@
 //! The current broad phase is the naive O(n^2) all-pairs scan; a spatial
 //! acceleration structure can be slotted in later without changing the
 //! narrow-phase geometry below.
+//!
+//! # Limitation: the straight-line (chord) approximation
+//!
+//! The chord replaces each object's true curved orbital arc over the step with
+//! the straight line between its endpoints. The error is the sag between the
+//! arc and its chord, which grows with the fraction of an orbit covered per
+//! step: it is roughly `r * theta^2 / 8`, where `theta` is the swept angle.
+//! For a near-circular LEO orbit (~90 min period, `r ~ 7000` km) a 30 s step
+//! sweeps ~2 deg and the sag is only ~centimeters, but the error grows
+//! quadratically, so a multi-minute step "cuts the corner" by kilometers. That
+//! is the core speed-vs-accuracy tradeoff of a larger `dt`: it can both miss
+//! real close approaches near a chord's midpoint and manufacture false ones by
+//! shortcutting curvature. With hard-body radii on the order of meters, this
+//! bounds how large `dt` can be before detection quality degrades.
+//!
+//! # Potential steps forward
+//!
+//! - **Sub-sample the arc:** split each step into `k` shorter chords (propagate
+//!   at `dt/k`) so the sag falls by `~1/k^2`; adapt `k` to the step size or to
+//!   each object's swept angle.
+//! - **Higher-order paths:** interpolate with the sampled velocity (Hermite /
+//!   quadratic in `s`) instead of a straight line, then minimize the resulting
+//!   quartic in `s` numerically.
+//! - **Conjunction screening:** apply a cheap pre-filter (e.g. orbit-geometry
+//!   or bounding-volume tests) so only plausibly-close pairs reach the
+//!   narrow-phase geometry, which also pairs naturally with a spatial broad
+//!   phase.
+//! - **Error-bounded stepping:** choose `dt` (or a per-pair refinement) from an
+//!   acceptable sag tolerance so accuracy is controlled rather than implicit.
 
 use nalgebra::Vector3;
 
