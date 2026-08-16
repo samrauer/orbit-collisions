@@ -1,6 +1,6 @@
-//! Fragmentation: replacing a collided pair with debris fragments.
+//! Fragmentation: replacing a collided cluster of objects with debris fragments.
 //!
-//! Every collision is treated as **catastrophic**: both parent objects are
+//! Every collision is treated as **catastrophic**: all parent objects are
 //! destroyed and replaced by `N` fragments whose combined mass equals the
 //! parents' combined mass. The model conserves **total mass** and **total
 //! linear momentum** exactly, by construction. Kinetic energy is *not*
@@ -9,13 +9,19 @@
 //! fragment dispersal energy; the remainder is the inelastic (heat/deformation)
 //! sink.
 //!
+//! Usually a cluster is the two objects of a single collision, but when one
+//! step produces collisions that share an object the whole pileup breaks up as
+//! one event, so the model is written for `k >= 2` parents throughout.
+//!
 //! # Method
 //!
-//! Let the parents be `(m1, v1)` and `(m2, v2)`, with `M = m1 + m2`.
+//! Let the parents be `(m_1, v_1) .. (m_k, v_k)`, with `M = sum(m_i)`.
 //!
-//! - **Center of mass:** `v_cm = (m1 v1 + m2 v2) / M`; total momentum `M v_cm`.
-//! - **Available energy:** in the CM frame, `E_cm = 1/2 mu |v1 - v2|^2`, with
-//!   reduced mass `mu = m1 m2 / M`.
+//! - **Center of mass:** `v_cm = sum(m_i v_i) / M`; total momentum `M v_cm`.
+//! - **Available energy:** the kinetic energy in the CM frame,
+//!   `E_cm = sum(1/2 m_i |v_i - v_cm|^2)`. For the two-body case this is
+//!   identically `1/2 mu |v_1 - v_2|^2` with reduced mass `mu = m_1 m_2 / M`,
+//!   the familiar form — the sum is just the version that also covers a pileup.
 //! - **Count:** `N = round(count_coefficient * (E_cm / E_ref)^count_exponent)`,
 //!   clamped to `[min_fragments, max_fragments]`. This is *loosely inspired by*,
 //!   not a reproduction of, the NASA Standard Breakup Model (see References):
@@ -30,7 +36,7 @@
 //!   kinetic energy equals `energy_efficiency * E_cm`. Both operations preserve
 //!   the momentum constraint because they are linear in `dv_i`.
 //! - **Radii:** derived from mass at the parents' (blended) density, which also
-//!   conserves total volume: `r_i = ((m_i / M) * (r1^3 + r2^3))^(1/3)`.
+//!   conserves total volume: `r_i = ((m_i / M) * sum(r_j^3))^(1/3)`.
 //! - **Positions:** dispersed on a small cloud around the impact point so the
 //!   newly-created, otherwise co-located fragments are not immediately flagged
 //!   as mutually colliding on the next step.
@@ -67,7 +73,8 @@ pub struct FragmentationConfig {
     pub count_exponent: f64,
     /// Reference energy (Joules) that normalizes the count power law.
     pub reference_energy_joules: f64,
-    /// Minimum fragments produced by any collision.
+    /// Minimum fragments produced by any collision. Raised to the parent count
+    /// when a pileup destroys more objects than this.
     pub min_fragments: usize,
     /// Cap on fragments per collision (keeps the catalog bounded / fast).
     pub max_fragments: usize,
@@ -108,8 +115,8 @@ impl Default for FragmentationConfig {
             // Normalizer for the count law: ~1 GJ is a moderate LEO impact, so
             // count_coefficient reads directly as "fragments per moderate hit."
             reference_energy_joules: 1.0e9,
-            // A "collision" must yield at least a pair, even in the degenerate
-            // near-zero-energy case, so the two parents are always replaced.
+            // A collision must yield at least a pair, even in the degenerate
+            // near-zero-energy case, so the parents are always replaced.
             min_fragments: 2,
             // Real catastrophic breakups can shed thousands of trackable
             // pieces; we cap at 1000 to bound catalog growth and keep the
@@ -130,29 +137,46 @@ impl Default for FragmentationConfig {
     }
 }
 
-/// Break a collided pair into debris fragments about `impact_point`.
+/// Break a collided cluster of objects into debris fragments about
+/// `impact_point`.
 ///
-/// Consumes the two parents (the caller is responsible for removing them from
-/// the catalog) and returns the fragments, drawing consecutive ids from
-/// `next_id` — the counter owned by the catalog the fragments will join, so
-/// that they cannot duplicate the id of an object already in it.
-pub fn fragment_collision<R: Rng + RngExt + ?Sized>(
-    a: &Object,
-    b: &Object,
+/// `parents` is the whole set destroyed by this breakup: the two objects of an
+/// ordinary collision, or every object caught in a pileup. Consumes them (the
+/// caller is responsible for removing them from the catalog) and returns the
+/// fragments, drawing consecutive ids from `next_id` — the counter owned by the
+/// catalog the fragments will join, so that they cannot duplicate the id of an
+/// object already in it.
+///
+/// # Panics
+///
+/// If `parents` is empty, or their combined mass is not positive; a breakup
+/// with nothing to break up has no center-of-mass frame to work in.
+pub fn fragment_cluster<R: Rng + RngExt + ?Sized>(
+    parents: &[Object],
     impact_point: Vector3<f64>,
     config: &FragmentationConfig,
     next_id: &mut u64,
     rng: &mut R,
 ) -> Vec<Object> {
-    let total_mass = a.mass + b.mass;
-    let v_cm = (a.mass * a.vel + b.mass * b.vel) / total_mass;
-    let reduced_mass = a.mass * b.mass / total_mass;
-    let v_rel = a.vel - b.vel;
-    // CM-frame available energy, in kg*(km/s)^2 and in Joules.
-    let e_cm_natural = 0.5 * reduced_mass * v_rel.norm_squared();
+    let total_mass: f64 = parents.iter().map(|p| p.mass).sum();
+    assert!(
+        total_mass > 0.0,
+        "a breakup needs at least one parent carrying mass"
+    );
+    let momentum = parents
+        .iter()
+        .fold(Vector3::zeros(), |acc, p| acc + p.vel.scale(p.mass));
+    let v_cm = momentum / total_mass;
+
+    // Available energy is the parents' kinetic energy in the CM frame. For two
+    // parents this equals the reduced-mass form 1/2 mu |v1 - v2|^2 exactly.
+    let e_cm_natural: f64 = parents
+        .iter()
+        .map(|p| 0.5 * p.mass * (p.vel - v_cm).norm_squared())
+        .sum();
     let e_cm_joules = e_cm_natural * KM2_S2_TO_JOULES;
 
-    let n = fragment_count(e_cm_joules, config);
+    let n = fragment_count(e_cm_joules, parents.len(), config);
 
     // Power-law masses, normalized so they sum to the combined parent mass.
     let raw_weights: Vec<f64> = (0..n)
@@ -191,9 +215,9 @@ pub fn fragment_collision<R: Rng + RngExt + ?Sized>(
         *d *= scale;
     }
 
-    // Volume term: total volume is proportional to r1^3 + r2^3 and is conserved
+    // Volume term: total volume is proportional to sum(r_i^3) and is conserved
     // because the fragment masses sum to M at a common (blended) density.
-    let volume_term = a.radius.powi(3) + b.radius.powi(3);
+    let volume_term: f64 = parents.iter().map(|p| p.radius.powi(3)).sum();
 
     (0..n)
         .map(|i| {
@@ -209,10 +233,18 @@ pub fn fragment_collision<R: Rng + RngExt + ?Sized>(
 }
 
 /// Number of fragments from the energy-scaled power law.
-fn fragment_count(e_cm_joules: f64, config: &FragmentationConfig) -> usize {
+///
+/// The floor rises to `parent_count` so a breakup never returns fewer pieces
+/// than it consumed. `max_fragments` caps it either way, so the clamp range can
+/// never come out inverted.
+fn fragment_count(e_cm_joules: f64, parent_count: usize, config: &FragmentationConfig) -> usize {
+    let floor = config
+        .min_fragments
+        .max(parent_count)
+        .min(config.max_fragments);
     let scaled = (e_cm_joules / config.reference_energy_joules).powf(config.count_exponent);
     let n = (config.count_coefficient * scaled).round();
-    (n as usize).clamp(config.min_fragments, config.max_fragments)
+    (n as usize).clamp(floor, config.max_fragments)
 }
 
 /// Sample a Pareto(shape) value in `[1, inf)` via inverse-CDF; larger values
@@ -251,10 +283,21 @@ mod tests {
     fn fragment(seed: u64) -> (Object, Object, Vec<Object>) {
         let (a, b) = colliding_pair();
         let impact = (a.pos + b.pos) / 2.0;
+        let frags = break_up(&[a.clone(), b.clone()], impact, seed);
+        (a, b, frags)
+    }
+
+    /// Break up an arbitrary cluster with the default config and a seeded rng.
+    fn break_up(parents: &[Object], impact: Vector3<f64>, seed: u64) -> Vec<Object> {
         let mut rng = StdRng::seed_from_u64(seed);
         let mut next_id = 100;
-        let frags = fragment_collision(&a, &b, impact, &FragmentationConfig::default(), &mut next_id, &mut rng);
-        (a, b, frags)
+        fragment_cluster(
+            parents,
+            impact,
+            &FragmentationConfig::default(),
+            &mut next_id,
+            &mut rng,
+        )
     }
 
     #[test]
@@ -325,16 +368,36 @@ mod tests {
     #[test]
     fn higher_energy_yields_more_fragments() {
         let low = FragmentationConfig::default();
-        let n_low = fragment_count(1.0e9, &low);
-        let n_high = fragment_count(1.0e11, &low);
+        let n_low = fragment_count(1.0e9, 2, &low);
+        let n_high = fragment_count(1.0e11, 2, &low);
         assert!(n_high > n_low, "{n_high} !> {n_low}");
     }
 
     #[test]
     fn count_is_clamped_to_bounds() {
         let config = FragmentationConfig::default();
-        assert_eq!(fragment_count(0.0, &config), config.min_fragments);
-        assert_eq!(fragment_count(1.0e300, &config), config.max_fragments);
+        assert_eq!(fragment_count(0.0, 2, &config), config.min_fragments);
+        assert_eq!(fragment_count(1.0e300, 2, &config), config.max_fragments);
+    }
+
+    #[test]
+    fn count_never_falls_below_the_parent_count() {
+        // A zero-energy pileup still has to replace everything it destroyed,
+        // even though that is well above the configured minimum.
+        let config = FragmentationConfig::default();
+        let parents = 7;
+        assert!(parents > config.min_fragments);
+        assert_eq!(fragment_count(0.0, parents, &config), parents);
+    }
+
+    #[test]
+    fn the_parent_count_floor_still_respects_the_cap() {
+        // A cluster larger than max_fragments must not invert the clamp range.
+        let config = FragmentationConfig {
+            max_fragments: 4,
+            ..FragmentationConfig::default()
+        };
+        assert_eq!(fragment_count(0.0, 50, &config), 4);
     }
 
     #[test]
@@ -349,11 +412,87 @@ mod tests {
         // No relative velocity => no available energy => fragments all move at v_cm.
         let a = parent(1, Vector3::new(7000.0, 0.0, 0.0), Vector3::new(0.0, 7.5, 0.0), 0.003, 800.0);
         let b = parent(2, Vector3::new(7000.0, 0.05, 0.0), Vector3::new(0.0, 7.5, 0.0), 0.002, 400.0);
-        let mut rng = StdRng::seed_from_u64(9);
-        let mut next_id = 0;
-        let frags = fragment_collision(&a, &b, a.pos, &FragmentationConfig::default(), &mut next_id, &mut rng);
-        for f in &frags {
+        let impact = a.pos;
+        for f in &break_up(&[a.clone(), b], impact, 9) {
             assert_relative_eq!(f.vel, a.vel, epsilon = 1e-12);
         }
+    }
+
+    /// Three objects caught in one pileup, with distinct masses and velocities.
+    fn colliding_triple() -> Vec<Object> {
+        vec![
+            parent(1, Vector3::new(7000.0, 0.0, 0.0), Vector3::new(0.0, 7.5, 0.0), 0.003, 800.0),
+            parent(2, Vector3::new(7000.0, 0.1, 0.0), Vector3::new(0.0, -7.0, 1.0), 0.002, 400.0),
+            parent(3, Vector3::new(7000.05, 0.05, 0.0), Vector3::new(1.0, 0.5, -7.2), 0.004, 250.0),
+        ]
+    }
+
+    #[test]
+    fn a_three_parent_pileup_conserves_mass_momentum_and_volume() {
+        let parents = colliding_triple();
+        let impact = Vector3::new(7000.0, 0.05, 0.0);
+        let frags = break_up(&parents, impact, 21);
+
+        let mass_before: f64 = parents.iter().map(|p| p.mass).sum();
+        let mass_after: f64 = frags.iter().map(|f| f.mass).sum();
+        assert_relative_eq!(mass_after, mass_before, epsilon = 1e-9);
+
+        let momentum_before = parents
+            .iter()
+            .fold(Vector3::zeros(), |acc, p| acc + p.vel.scale(p.mass));
+        let momentum_after = frags
+            .iter()
+            .fold(Vector3::zeros(), |acc, f| acc + f.vel.scale(f.mass));
+        assert_relative_eq!(momentum_after, momentum_before, epsilon = 1e-9);
+
+        let volume_before: f64 = parents.iter().map(|p| p.radius.powi(3)).sum();
+        let volume_after: f64 = frags.iter().map(|f| f.radius.powi(3)).sum();
+        assert_relative_eq!(volume_after, volume_before, epsilon = 1e-9);
+
+        assert!(frags.len() >= parents.len());
+    }
+
+    #[test]
+    fn a_three_parent_pileup_returns_the_target_fraction_of_energy() {
+        let parents = colliding_triple();
+        let frags = break_up(&parents, Vector3::new(7000.0, 0.05, 0.0), 22);
+
+        let total_mass: f64 = parents.iter().map(|p| p.mass).sum();
+        let v_cm = parents
+            .iter()
+            .fold(Vector3::zeros(), |acc, p| acc + p.vel.scale(p.mass))
+            / total_mass;
+        let e_cm: f64 = parents
+            .iter()
+            .map(|p| 0.5 * p.mass * (p.vel - v_cm).norm_squared())
+            .sum();
+
+        let frag_ke: f64 = frags
+            .iter()
+            .map(|f| 0.5 * f.mass * (f.vel - v_cm).norm_squared())
+            .sum();
+        assert_relative_eq!(
+            frag_ke,
+            FragmentationConfig::default().energy_efficiency * e_cm,
+            epsilon = 1e-9
+        );
+    }
+
+    #[test]
+    fn two_parent_energy_matches_the_reduced_mass_form() {
+        // The N-parent CM-frame sum must agree with 1/2 mu |v1 - v2|^2 exactly,
+        // which is what keeps the two-body physics unchanged by the pileup work.
+        let (a, b) = colliding_pair();
+        let total_mass = a.mass + b.mass;
+        let v_cm = (a.mass * a.vel + b.mass * b.vel) / total_mass;
+
+        let summed: f64 = [&a, &b]
+            .iter()
+            .map(|p| 0.5 * p.mass * (p.vel - v_cm).norm_squared())
+            .sum();
+        let reduced = a.mass * b.mass / total_mass;
+        let closed_form = 0.5 * reduced * (a.vel - b.vel).norm_squared();
+
+        assert_relative_eq!(summed, closed_form, epsilon = 1e-12);
     }
 }

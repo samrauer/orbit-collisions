@@ -1,9 +1,38 @@
-use nalgebra::Vector3;
-use rand::Rng;
+use std::collections::{HashMap, HashSet};
 
+use nalgebra::Vector3;
+use rand::{Rng, RngExt};
+
+use crate::simulation::cluster::group_collisions_into_clusters;
 use crate::simulation::collision::{DetectionReport, detect_collisions};
+use crate::simulation::fragment::{FragmentationConfig, fragment_cluster};
 use crate::simulation::object::Object;
 use crate::simulation::spawn::Spawner;
+
+/// One breakup applied during a step: a set of objects destroyed and replaced.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Breakup {
+    /// The objects destroyed, ascending. Two for an ordinary collision, more
+    /// when a pileup merged several collisions into one event.
+    pub parent_ids: Vec<u64>,
+    /// How many fragments replaced them.
+    pub fragment_count: usize,
+    /// Where the breakup was anchored (km, inertial).
+    pub impact_point: Vector3<f64>,
+    /// Step fraction in `[0, 1]` at which it was anchored.
+    pub fraction: f64,
+}
+
+/// What one [`SimulationState::step`] did.
+#[derive(Clone, Debug, Default)]
+pub struct StepReport {
+    /// Collisions and close-approach statistics for the step.
+    pub detection: DetectionReport,
+    /// The breakups applied, one per pileup.
+    pub breakups: Vec<Breakup>,
+    /// Total fragments added to the catalog this step.
+    pub fragments_created: usize,
+}
 
 /// Holds the state of every active debris object / satellite in the
 /// simulation.
@@ -95,6 +124,86 @@ impl SimulationState {
         self.propagate(dt);
         detect_collisions(&self.objects, &previous_positions)
     }
+
+    /// Advance the simulation by one full step: propagate, detect collisions,
+    /// and replace everything that collided with its debris.
+    ///
+    /// This is the cascade loop — the fragments added here are ordinary catalog
+    /// objects, so they collide on later steps like anything else.
+    pub fn step<R: Rng + RngExt + ?Sized>(
+        &mut self,
+        dt: f64,
+        config: &FragmentationConfig,
+        rng: &mut R,
+    ) -> StepReport {
+        let detection = self.step_and_detect(dt);
+        if detection.collisions.is_empty() {
+            return StepReport {
+                detection,
+                ..StepReport::default()
+            };
+        }
+
+        let index_by_id: HashMap<u64, usize> = self
+            .objects
+            .iter()
+            .enumerate()
+            .map(|(index, object)| (object.id, index))
+            .collect();
+
+        let mut breakups = Vec::new();
+        let mut fragments = Vec::new();
+        let mut destroyed: HashSet<u64> = HashSet::new();
+
+        for cluster in group_collisions_into_clusters(&detection.collisions) {
+            // Clone the parents out of the catalog before fragmenting: the
+            // breakup needs the id counter, which lives in the same struct as
+            // the objects, so it cannot borrow from both at once. Clusters hold
+            // a handful of objects, so this is cheap.
+            let parents: Vec<Object> = cluster
+                .parent_ids
+                .iter()
+                .map(|id| self.objects[index_by_id[id]].clone())
+                .collect();
+
+            let mut cluster_fragments = fragment_cluster(
+                &parents,
+                cluster.seed.impact_point,
+                config,
+                &mut self.next_id,
+                rng,
+            );
+
+            // The breakup happened partway through the step, but every other
+            // object is already at the end of it. Carry the fragments through
+            // the rest of the step so the catalog stays at one instant.
+            let remaining = (1.0 - cluster.seed.fraction) * dt;
+            for fragment in &mut cluster_fragments {
+                fragment.propagate(remaining);
+            }
+
+            destroyed.extend(&cluster.parent_ids);
+            breakups.push(Breakup {
+                parent_ids: cluster.parent_ids,
+                fragment_count: cluster_fragments.len(),
+                impact_point: cluster.seed.impact_point,
+                fraction: cluster.seed.fraction,
+            });
+            fragments.append(&mut cluster_fragments);
+        }
+
+        self.objects.retain(|object| !destroyed.contains(&object.id));
+        let fragments_created = fragments.len();
+        for fragment in fragments {
+            self.push(fragment);
+        }
+
+        StepReport {
+            detection,
+            breakups,
+            fragments_created,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -102,6 +211,7 @@ mod tests {
     use super::*;
     use crate::simulation::object::ObjectKind;
     use crate::simulation::spawn::SpawnConfig;
+    use approx::assert_relative_eq;
     use nalgebra::Vector3;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
@@ -200,6 +310,162 @@ mod tests {
         let ids: Vec<u64> = state.iter().map(|o| o.id).collect();
         assert_eq!(ids, vec![7, 8, 9, 10, 11]);
         assert_eq!(state.next_id(), 12);
+    }
+
+    /// [`sample_object`]'s counterpart on the far side of the same orbit.
+    fn antipode(id: u64) -> Object {
+        let mut object = sample_object(id);
+        object.pos = -object.pos;
+        object.vel = -object.vel;
+        object
+    }
+
+    /// An object at a LEO-ish state, sized so the fixtures below overlap.
+    fn colliding_object(id: u64, offset: Vector3<f64>, vel: Vector3<f64>, mass: f64) -> Object {
+        Object::new(
+            id,
+            Vector3::new(7000.0, 0.0, 0.0) + offset,
+            vel,
+            0.003,
+            mass,
+            ObjectKind::Intact,
+        )
+    }
+
+    /// Two objects overlapping at the start of the step, closing fast.
+    fn crossing_pair() -> [Object; 2] {
+        [
+            colliding_object(1, Vector3::zeros(), Vector3::new(0.0, 7.5, 0.0), 800.0),
+            colliding_object(
+                2,
+                Vector3::new(0.0, 0.002, 0.0),
+                Vector3::new(0.0, -7.0, 1.0),
+                400.0,
+            ),
+        ]
+    }
+
+    fn total_mass(state: &SimulationState) -> f64 {
+        state.iter().map(|o| o.mass).sum()
+    }
+
+    #[test]
+    fn a_collision_replaces_its_parents_with_fragments() {
+        let mut state = SimulationState::from_objects(crossing_pair());
+        let mass_before = total_mass(&state);
+        let report = state.step(
+            30.0,
+            &FragmentationConfig::default(),
+            &mut StdRng::seed_from_u64(1),
+        );
+
+        assert_eq!(report.breakups.len(), 1);
+        assert_eq!(report.breakups[0].parent_ids, vec![1, 2]);
+        assert_eq!(report.breakups[0].fragment_count, report.fragments_created);
+
+        // Both parents are gone and every remaining object is debris.
+        assert!(state.iter().all(|o| o.id != 1 && o.id != 2));
+        assert!(state.iter().all(|o| o.kind == ObjectKind::Fragment));
+        assert_eq!(state.len(), report.fragments_created);
+        assert_relative_eq!(total_mass(&state), mass_before, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn a_pileup_becomes_one_breakup_naming_every_parent() {
+        // Three mutually overlapping objects produce three pairwise collisions.
+        // They must resolve as a single breakup of all three, not as separate
+        // events that would destroy a shared object twice and duplicate mass.
+        let mut state = SimulationState::from_objects([
+            colliding_object(1, Vector3::zeros(), Vector3::new(0.0, 7.5, 0.0), 800.0),
+            colliding_object(
+                2,
+                Vector3::new(0.0, 0.002, 0.0),
+                Vector3::new(0.0, -7.0, 1.0),
+                400.0,
+            ),
+            colliding_object(
+                3,
+                Vector3::new(0.0, 0.001, 0.001),
+                Vector3::new(1.0, 0.5, -7.2),
+                250.0,
+            ),
+        ]);
+        let mass_before = total_mass(&state);
+        let report = state.step(
+            30.0,
+            &FragmentationConfig::default(),
+            &mut StdRng::seed_from_u64(2),
+        );
+
+        assert_eq!(report.detection.collisions.len(), 3, "three pairwise hits");
+        assert_eq!(report.breakups.len(), 1, "merged into one breakup");
+        assert_eq!(report.breakups[0].parent_ids, vec![1, 2, 3]);
+        assert_relative_eq!(total_mass(&state), mass_before, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn a_step_without_collisions_changes_nothing_but_position() {
+        // Antipodal on the same circular orbit, so they stay half an orbit
+        // apart and never come near each other.
+        let mut state = SimulationState::from_objects([sample_object(1), antipode(2)]);
+        let next_id_before = state.next_id();
+        let report = state.step(
+            30.0,
+            &FragmentationConfig::default(),
+            &mut StdRng::seed_from_u64(3),
+        );
+
+        assert!(report.breakups.is_empty());
+        assert_eq!(report.fragments_created, 0);
+        assert_eq!(state.len(), 2);
+        assert_eq!(state.next_id(), next_id_before);
+    }
+
+    #[test]
+    fn fragments_are_carried_to_the_end_of_the_step() {
+        // The breakup is anchored partway through the step, but the catalog is
+        // already at the end of it, so fragments must be propagated the rest of
+        // the way rather than left at the impact point.
+        let dt = 30.0;
+        let mut state = SimulationState::from_objects(crossing_pair());
+        let report = state.step(
+            dt,
+            &FragmentationConfig::default(),
+            &mut StdRng::seed_from_u64(4),
+        );
+
+        let breakup = &report.breakups[0];
+        assert!(breakup.fraction < 1.0, "nothing left of the step to travel");
+
+        // Left unpropagated they would all sit exactly cloud_radius_km away.
+        let cloud = FragmentationConfig::default().cloud_radius_km;
+        let travelled = (1.0 - breakup.fraction) * dt;
+        for fragment in state.iter() {
+            let drift = (fragment.pos - breakup.impact_point).norm();
+            assert!(
+                drift > cloud * 10.0,
+                "fragment {} only moved {drift} km in {travelled} s",
+                fragment.id
+            );
+        }
+    }
+
+    #[test]
+    fn fragment_ids_continue_from_the_catalog_counter() {
+        // Fragments join the catalog mid-run, so their ids must come from the
+        // same counter the parents' did — including ids the parents retired.
+        let mut state = SimulationState::from_objects(crossing_pair());
+        let mut rng = StdRng::seed_from_u64(5);
+        state.step(30.0, &FragmentationConfig::default(), &mut rng);
+
+        let ids: Vec<u64> = state.iter().map(|o| o.id).collect();
+        assert!(ids.iter().all(|&id| id >= 2), "reused a retired parent id");
+
+        let mut unique = ids.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), ids.len(), "duplicate fragment ids");
+        assert_eq!(state.next_id(), ids.iter().max().unwrap() + 1);
     }
 
     #[test]
