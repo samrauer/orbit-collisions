@@ -41,27 +41,27 @@ impl Default for SpawnConfig {
     }
 }
 
-/// Generates random [`Object`]s from a [`SpawnConfig`], assigning unique,
-/// monotonically increasing ids.
+/// Generates random [`Object`]s from a [`SpawnConfig`].
+///
+/// Ids are supplied by the caller rather than by a counter of the spawner's
+/// own, so that spawned objects and collision fragments — which the simulation
+/// creates through entirely different paths — draw from the one counter the
+/// catalog owns and cannot be issued the same id.
 #[derive(Clone, Debug)]
 pub struct Spawner {
     config: SpawnConfig,
-    next_id: u64,
 }
 
 impl Spawner {
     pub fn new(config: SpawnConfig) -> Self {
-        Self { config, next_id: 0 }
+        Self { config }
     }
 
-    /// The id that will be assigned to the next spawned object. Useful for
-    /// keeping fragment ids from colliding with spawned ones.
-    pub fn next_id(&self) -> u64 {
-        self.next_id
-    }
-
-    /// Sample a single random intact object.
-    pub fn spawn_one<R: Rng + ?Sized>(&mut self, rng: &mut R) -> Object {
+    /// Sample a single random intact object, given the id it should carry.
+    ///
+    /// Private so that `spawn_many` is the only way in: an id chosen by hand
+    /// here would not have come from the catalog's counter.
+    fn spawn_one<R: Rng + ?Sized>(&self, id: u64, rng: &mut R) -> Object {
         let c = &self.config;
         let a = EARTH_RADIUS_KM + rng.random_range(c.altitude_km.clone());
         let elems = ClassicalElements {
@@ -74,8 +74,6 @@ impl Spawner {
         };
         let (pos, vel) = elems.to_cartesian();
 
-        let id = self.next_id;
-        self.next_id += 1;
         Object::new(
             id,
             pos,
@@ -86,9 +84,21 @@ impl Spawner {
         )
     }
 
-    /// Sample `count` random intact objects.
-    pub fn spawn_many<R: Rng + ?Sized>(&mut self, count: usize, rng: &mut R) -> Vec<Object> {
-        (0..count).map(|_| self.spawn_one(rng)).collect()
+    /// Sample `count` random intact objects, drawing consecutive ids from
+    /// `next_id` (typically the catalog's own counter).
+    pub fn spawn_many<R: Rng + ?Sized>(
+        &self,
+        count: usize,
+        next_id: &mut u64,
+        rng: &mut R,
+    ) -> Vec<Object> {
+        (0..count)
+            .map(|_| {
+                let id = *next_id;
+                *next_id += 1;
+                self.spawn_one(id, rng)
+            })
+            .collect()
     }
 }
 
@@ -103,20 +113,35 @@ mod tests {
     #[test]
     fn ids_are_unique_and_sequential() {
         let mut rng = StdRng::seed_from_u64(42);
-        let mut spawner = Spawner::new(SpawnConfig::default());
-        let objects = spawner.spawn_many(100, &mut rng);
+        let spawner = Spawner::new(SpawnConfig::default());
+        let mut next_id = 0;
+        let objects = spawner.spawn_many(100, &mut next_id, &mut rng);
         for (i, obj) in objects.iter().enumerate() {
             assert_eq!(obj.id, i as u64);
         }
-        assert_eq!(spawner.next_id(), 100);
+        assert_eq!(next_id, 100);
+    }
+
+    #[test]
+    fn ids_continue_from_the_supplied_counter() {
+        // Spawning against a counter that has already issued ids (fragments,
+        // an earlier batch) must not restart the numbering.
+        let mut rng = StdRng::seed_from_u64(11);
+        let spawner = Spawner::new(SpawnConfig::default());
+        let mut next_id = 500;
+        let objects = spawner.spawn_many(3, &mut next_id, &mut rng);
+        let assigned: Vec<u64> = objects.iter().map(|o| o.id).collect();
+        assert_eq!(assigned, vec![500, 501, 502]);
+        assert_eq!(next_id, 503);
     }
 
     #[test]
     fn spawned_objects_respect_config_ranges() {
         let mut rng = StdRng::seed_from_u64(7);
         let config = SpawnConfig::default();
-        let mut spawner = Spawner::new(config.clone());
-        for obj in spawner.spawn_many(500, &mut rng) {
+        let spawner = Spawner::new(config.clone());
+        let mut next_id = 0;
+        for obj in spawner.spawn_many(500, &mut next_id, &mut rng) {
             assert_eq!(obj.kind, ObjectKind::Intact);
             assert!(config.radius_km.contains(&obj.radius));
             assert!(config.mass_kg.contains(&obj.mass));
@@ -137,10 +162,9 @@ mod tests {
 
     #[test]
     fn deterministic_for_a_given_seed() {
-        let mut spawner_a = Spawner::new(SpawnConfig::default());
-        let mut spawner_b = Spawner::new(SpawnConfig::default());
-        let a = spawner_a.spawn_many(10, &mut StdRng::seed_from_u64(1));
-        let b = spawner_b.spawn_many(10, &mut StdRng::seed_from_u64(1));
+        let spawner = Spawner::new(SpawnConfig::default());
+        let a = spawner.spawn_many(10, &mut 0, &mut StdRng::seed_from_u64(1));
+        let b = spawner.spawn_many(10, &mut 0, &mut StdRng::seed_from_u64(1));
         assert_eq!(a, b);
     }
 }

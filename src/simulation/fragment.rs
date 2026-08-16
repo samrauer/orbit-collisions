@@ -133,7 +133,9 @@ impl Default for FragmentationConfig {
 /// Break a collided pair into debris fragments about `impact_point`.
 ///
 /// Consumes the two parents (the caller is responsible for removing them from
-/// the catalog) and returns the fragments, assigning ids from `next_id`.
+/// the catalog) and returns the fragments, drawing consecutive ids from
+/// `next_id` — the counter owned by the catalog the fragments will join, so
+/// that they cannot duplicate the id of an object already in it.
 pub fn fragment_collision<R: Rng + RngExt + ?Sized>(
     a: &Object,
     b: &Object,

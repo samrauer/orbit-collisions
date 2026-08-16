@@ -56,6 +56,10 @@ pub struct ClosestApproach {
     pub separation: f64,
     /// Step fraction in `[0, 1]` at which the closest approach occurs.
     pub fraction: f64,
+    /// Point halfway between the two objects at closest approach (km,
+    /// inertial). For an actual collision this is the impact site; for a near
+    /// miss it is just the midpoint of the gap.
+    pub midpoint: Vector3<f64>,
 }
 
 /// Compute the closest approach between two objects over a single step, given
@@ -64,7 +68,8 @@ pub struct ClosestApproach {
 /// The relative position is `rel(s) = d0 + s * (d1 - d0)` for `s in [0, 1]`,
 /// where `d0`/`d1` are the center-to-center offsets at the start/end of the
 /// step. The minimum of `|rel(s)|` is found analytically and the parameter is
-/// clamped to the step interval.
+/// clamped to the step interval. Both objects are then interpolated to that
+/// parameter to recover where in space the approach happened.
 pub fn segment_closest_approach(
     a_start: Vector3<f64>,
     a_end: Vector3<f64>,
@@ -83,10 +88,14 @@ pub fn segment_closest_approach(
         (-d0.dot(&w) / ww).clamp(0.0, 1.0)
     };
 
-    let rel = d0 + fraction * w;
+    // Walk both objects to the closest-approach parameter, which gives the
+    // separation and the location of the approach in one shot.
+    let a_at = a_start.lerp(&a_end, fraction);
+    let b_at = b_start.lerp(&b_end, fraction);
     ClosestApproach {
-        separation: rel.norm(),
+        separation: (a_at - b_at).norm(),
         fraction,
+        midpoint: (a_at + b_at) * 0.5,
     }
 }
 
@@ -101,6 +110,13 @@ pub struct Encounter {
     pub surface_gap: f64,
     /// Step fraction in `[0, 1]` at which the closest approach occurred.
     pub fraction: f64,
+    /// Where the closest approach happened (km, inertial): the midpoint between
+    /// the two objects at that instant. For a collision this is the impact site
+    /// a breakup model disperses fragments around. The midpoint is used rather
+    /// than the pair's center of mass because the two differ by at most the
+    /// summed hard-body radii — meters — which is negligible beside the
+    /// dispersal cloud fragments are seeded on.
+    pub impact_point: Vector3<f64>,
 }
 
 impl Encounter {
@@ -155,6 +171,7 @@ pub fn detect_collisions(
                 separation: ca.separation,
                 surface_gap,
                 fraction: ca.fraction,
+                impact_point: ca.midpoint,
             };
 
             report.pairs_checked += 1;
@@ -184,7 +201,7 @@ mod tests {
     }
 
     #[test]
-    fn perpendicular_paths_cross_at_midpoint() {
+    fn perpendicular_paths_cross_at_mid_step() {
         // A sweeps along x through the origin, B along y through the origin,
         // both reaching it at the same instant (s = 0.5).
         let ca = segment_closest_approach(
@@ -195,6 +212,8 @@ mod tests {
         );
         assert_relative_eq!(ca.separation, 0.0, epsilon = 1e-12);
         assert_relative_eq!(ca.fraction, 0.5, epsilon = 1e-12);
+        // They meet at the origin, so that is where the approach happened.
+        assert_relative_eq!(ca.midpoint, v(0.0, 0.0, 0.0), epsilon = 1e-12);
     }
 
     #[test]
@@ -208,6 +227,9 @@ mod tests {
         );
         assert_relative_eq!(ca.separation, 5.0, epsilon = 1e-12);
         assert_eq!(ca.fraction, 0.0);
+        // Constant separation pins the approach to the start of the step, half
+        // way across the 5 km offset in y.
+        assert_relative_eq!(ca.midpoint, v(0.0, 2.5, 0.0), epsilon = 1e-12);
     }
 
     #[test]
@@ -222,6 +244,9 @@ mod tests {
         );
         assert_relative_eq!(ca.separation, 1.0, epsilon = 1e-12);
         assert_relative_eq!(ca.fraction, 1.0, epsilon = 1e-12);
+        // Clamping to the end of the step must also move the midpoint there:
+        // between A at the origin and B at its end position (1, 0, 0).
+        assert_relative_eq!(ca.midpoint, v(0.5, 0.0, 0.0), epsilon = 1e-12);
     }
 
     fn obj(id: u64, pos: Vector3<f64>, radius: f64) -> Object {
@@ -242,6 +267,8 @@ mod tests {
         assert_eq!((c.id_a, c.id_b), (1, 2));
         assert!(c.is_collision());
         assert_relative_eq!(c.fraction, 0.5, epsilon = 1e-12);
+        // The impact site a breakup model would disperse fragments around.
+        assert_relative_eq!(c.impact_point, v(0.0, 0.0, 0.0), epsilon = 1e-12);
     }
 
     #[test]
@@ -258,6 +285,9 @@ mod tests {
         let closest = report.closest.expect("a pair was checked");
         assert_relative_eq!(closest.separation, 2.0, epsilon = 1e-12);
         assert!(closest.surface_gap > 0.0);
+        // With the objects genuinely apart, the point sits between them rather
+        // than on either one: halfway across the 2 km gap in z.
+        assert_relative_eq!(closest.impact_point, v(0.0, 0.0, 1.0), epsilon = 1e-12);
     }
 
     #[test]
