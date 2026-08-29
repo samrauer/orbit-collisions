@@ -5,6 +5,7 @@ use rand::{Rng, RngExt};
 
 use crate::simulation::cluster::group_collisions_into_clusters;
 use crate::simulation::collision::{DetectionReport, detect_collisions};
+use crate::simulation::constants::{EARTH_RADIUS_KM, REENTRY_ALTITUDE_KM};
 use crate::simulation::fragment::{FragmentationConfig, fragment_cluster};
 use crate::simulation::object::Object;
 use crate::simulation::spawn::Spawner;
@@ -23,6 +24,21 @@ pub struct Breakup {
     pub fraction: f64,
 }
 
+/// One object removed after descending below the reentry altitude.
+///
+/// The whole object is kept, not just its id: its mass is what makes the
+/// catalog's mass balance checkable once objects can leave (surviving mass plus
+/// re-entered mass is conserved, where surviving mass alone no longer is), and
+/// its [`ObjectKind`](crate::simulation::ObjectKind) records whether what came
+/// down was debris or an intact satellite.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Reentry {
+    /// The object as it was when it was removed, at the end of the step.
+    pub object: Object,
+    /// Elapsed simulation time (seconds) at the end of that step.
+    pub elapsed_seconds: f64,
+}
+
 /// What one [`SimulationState::step`] did.
 #[derive(Clone, Debug, Default)]
 pub struct StepReport {
@@ -32,6 +48,8 @@ pub struct StepReport {
     pub breakups: Vec<Breakup>,
     /// Total fragments added to the catalog this step.
     pub fragments_created: usize,
+    /// The objects that re-entered and were removed this step.
+    pub reentries: Vec<Reentry>,
 }
 
 /// Holds the state of every active debris object / satellite in the
@@ -45,10 +63,25 @@ pub struct StepReport {
 /// Ids are never recycled: an object destroyed in a collision leaves its id
 /// retired, so an id names one object for the whole run and the parents
 /// recorded in a collision stay unambiguous afterwards.
+///
+/// # Reentry
+///
+/// Objects leave the catalog two ways: destroyed in a collision, or removed
+/// after descending below [`REENTRY_ALTITUDE_KM`]. The state keeps a log of the
+/// latter for the whole run, so a finished run can be asked what came down and
+/// when — and so the mass that left the catalog can still be accounted for.
+///
+/// Removal is by *current position*, not by perigee. An object on a doomed
+/// orbit is still physically up in the shell while it descends, and must stay
+/// collidable the whole way down — that descent through the traffic is exactly
+/// where a cascade does its damage, so culling it the moment its perigee dips
+/// would quietly delete the interesting case.
 #[derive(Clone, Debug, Default)]
 pub struct SimulationState {
     objects: Vec<Object>,
     next_id: u64,
+    elapsed_seconds: f64,
+    reentries: Vec<Reentry>,
 }
 
 impl SimulationState {
@@ -77,6 +110,16 @@ impl SimulationState {
     /// The id the catalog will assign next.
     pub fn next_id(&self) -> u64 {
         self.next_id
+    }
+
+    /// Simulation time elapsed (seconds) since the catalog was created.
+    pub fn elapsed_seconds(&self) -> f64 {
+        self.elapsed_seconds
+    }
+
+    /// Every object that has re-entered so far, in the order they came down.
+    pub fn reentries(&self) -> &[Reentry] {
+        &self.reentries
     }
 
     /// Spawn `count` random objects into the catalog, assigning them fresh ids.
@@ -109,10 +152,15 @@ impl SimulationState {
     }
 
     /// Advance every object forward by `dt` seconds under two-body motion.
+    ///
+    /// The clock is advanced here rather than in [`Self::step`] because this is
+    /// the one choke point every advance funnels through, so the elapsed time
+    /// stays correct whichever entry point a caller uses.
     pub fn propagate(&mut self, dt: f64) {
         for object in &mut self.objects {
             object.propagate(dt);
         }
+        self.elapsed_seconds += dt;
     }
 
     /// Advance every object by `dt` seconds and detect any collisions or close
@@ -126,10 +174,19 @@ impl SimulationState {
     }
 
     /// Advance the simulation by one full step: propagate, detect collisions,
-    /// and replace everything that collided with its debris.
+    /// replace everything that collided with its debris, and remove whatever
+    /// has descended into the atmosphere.
     ///
     /// This is the cascade loop — the fragments added here are ordinary catalog
     /// objects, so they collide on later steps like anything else.
+    ///
+    /// The reentry sweep runs *last*, after detection and fragmentation, for
+    /// two reasons. Removing objects before detection would desynchronize the
+    /// catalog from the previous-position slice that
+    /// [`detect_collisions`] indexes in parallel with it. And sweeping at the
+    /// end means an object still collides during the step it comes down on,
+    /// and that fragments born below the floor leave again immediately rather
+    /// than lingering a step underground.
     pub fn step<R: Rng + RngExt + ?Sized>(
         &mut self,
         dt: f64,
@@ -137,13 +194,32 @@ impl SimulationState {
         rng: &mut R,
     ) -> StepReport {
         let detection = self.step_and_detect(dt);
-        if detection.collisions.is_empty() {
-            return StepReport {
-                detection,
-                ..StepReport::default()
-            };
-        }
 
+        let (breakups, fragments_created) = if detection.collisions.is_empty() {
+            (Vec::new(), 0)
+        } else {
+            self.apply_breakups(&detection, dt, config, rng)
+        };
+
+        let reentries = self.remove_reentered_objects();
+
+        StepReport {
+            detection,
+            breakups,
+            fragments_created,
+            reentries,
+        }
+    }
+
+    /// Replace every object caught in this step's collisions with its debris,
+    /// returning the breakups applied and the total fragments created.
+    fn apply_breakups<R: Rng + RngExt + ?Sized>(
+        &mut self,
+        detection: &DetectionReport,
+        dt: f64,
+        config: &FragmentationConfig,
+        rng: &mut R,
+    ) -> (Vec<Breakup>, usize) {
         let index_by_id: HashMap<u64, usize> = self
             .objects
             .iter()
@@ -198,11 +274,33 @@ impl SimulationState {
             self.push(fragment);
         }
 
-        StepReport {
-            detection,
-            breakups,
-            fragments_created,
-        }
+        (breakups, fragments_created)
+    }
+
+    /// Remove every object that has descended below the reentry altitude,
+    /// appending each to the run log and returning this sweep's reentries.
+    ///
+    /// Draws no randomness, so it cannot perturb the rng sequence a run
+    /// replays from.
+    fn remove_reentered_objects(&mut self) -> Vec<Reentry> {
+        let floor_radius = EARTH_RADIUS_KM + REENTRY_ALTITUDE_KM;
+        let elapsed_seconds = self.elapsed_seconds;
+        let mut reentries = Vec::new();
+
+        // `retain` visits in order, so the log stays in catalog order.
+        self.objects.retain(|object| {
+            let has_reentered = object.pos.norm() < floor_radius;
+            if has_reentered {
+                reentries.push(Reentry {
+                    object: object.clone(),
+                    elapsed_seconds,
+                });
+            }
+            !has_reentered
+        });
+
+        self.reentries.extend(reentries.iter().cloned());
+        reentries
     }
 }
 
@@ -475,5 +573,143 @@ mod tests {
         state.propagate(60.0);
         let after = state.iter().next().unwrap().pos;
         assert!((after - before).norm() > 0.0);
+    }
+
+    /// The radius below which an object counts as having re-entered.
+    fn reentry_floor_radius() -> f64 {
+        EARTH_RADIUS_KM + REENTRY_ALTITUDE_KM
+    }
+
+    /// An object parked at `radius` on a slow, nearly-radial state, so a short
+    /// step cannot move it across the reentry floor on its own. This isolates
+    /// the sweep from the propagation.
+    fn object_at_radius(id: u64, radius: f64) -> Object {
+        Object::new(
+            id,
+            Vector3::new(radius, 0.0, 0.0),
+            Vector3::new(0.0, 0.001, 0.0),
+            0.003,
+            500.0,
+            ObjectKind::Intact,
+        )
+    }
+
+    fn step_once(state: &mut SimulationState, seed: u64) -> StepReport {
+        state.step(1.0, &FragmentationConfig::default(), &mut StdRng::seed_from_u64(seed))
+    }
+
+    #[test]
+    fn an_object_below_the_reentry_altitude_is_removed_and_recorded() {
+        let mut state =
+            SimulationState::from_objects([object_at_radius(1, reentry_floor_radius() - 10.0)]);
+        let report = step_once(&mut state, 1);
+
+        assert!(state.is_empty(), "the object was not removed");
+        assert_eq!(report.reentries.len(), 1);
+        assert_eq!(report.reentries[0].object.id, 1);
+        assert_eq!(state.reentries().len(), 1, "the run log did not record it");
+        assert_eq!(state.reentries()[0], report.reentries[0]);
+    }
+
+    #[test]
+    fn an_object_above_the_reentry_altitude_survives() {
+        let mut state =
+            SimulationState::from_objects([object_at_radius(1, reentry_floor_radius() + 10.0)]);
+        let report = step_once(&mut state, 1);
+
+        assert_eq!(state.len(), 1, "an object still in orbit was removed");
+        assert!(report.reentries.is_empty());
+        assert!(state.reentries().is_empty());
+    }
+
+    #[test]
+    fn reentry_is_swept_on_a_step_with_no_collisions() {
+        // The trap this guards: `step` used to return early when nothing
+        // collided. A lone object has no possible collision partner, so if the
+        // sweep sits behind that early return it never runs at all.
+        let mut state =
+            SimulationState::from_objects([object_at_radius(1, reentry_floor_radius() - 10.0)]);
+        let report = step_once(&mut state, 1);
+
+        assert!(
+            report.detection.collisions.is_empty(),
+            "the fixture was supposed to have nothing to collide with"
+        );
+        assert_eq!(report.reentries.len(), 1, "the sweep was skipped");
+        assert!(state.is_empty());
+    }
+
+    #[test]
+    fn mass_leaving_the_catalog_is_preserved_in_the_reentry_log() {
+        // Once objects can leave, the catalog's mass alone is no longer
+        // conserved. What is conserved is the mass still in orbit plus the mass
+        // recorded as having come down.
+        let mut state = SimulationState::from_objects([
+            object_at_radius(1, reentry_floor_radius() - 10.0),
+            object_at_radius(2, reentry_floor_radius() + 10.0),
+        ]);
+        let mass_before = total_mass(&state);
+        step_once(&mut state, 1);
+
+        let mass_reentered: f64 = state.reentries().iter().map(|r| r.object.mass).sum();
+        assert_relative_eq!(total_mass(&state) + mass_reentered, mass_before, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn the_clock_advances_and_stamps_each_reentry() {
+        let dt = 30.0;
+        let mut state = SimulationState::from_objects([
+            object_at_radius(1, reentry_floor_radius() + 10.0),
+            object_at_radius(2, reentry_floor_radius() - 10.0),
+        ]);
+        assert_eq!(state.elapsed_seconds(), 0.0);
+
+        let config = FragmentationConfig::default();
+        let mut rng = StdRng::seed_from_u64(1);
+
+        let report = state.step(dt, &config, &mut rng);
+        assert_relative_eq!(state.elapsed_seconds(), dt);
+        assert_relative_eq!(report.reentries[0].elapsed_seconds, dt);
+
+        state.step(dt, &config, &mut rng);
+        assert_relative_eq!(state.elapsed_seconds(), 2.0 * dt);
+
+        // The stamp records when the object came down, not when it is read.
+        assert_relative_eq!(state.reentries()[0].elapsed_seconds, dt);
+    }
+
+    #[test]
+    fn fragments_born_below_the_reentry_altitude_leave_the_same_step() {
+        // Fragments are created after detection, so the sweep has to run after
+        // fragmentation too — otherwise debris from a low-altitude breakup
+        // would spend a step propagating underground before being noticed.
+        let low = reentry_floor_radius() - 10.0;
+        let mut state = SimulationState::from_objects([
+            colliding_object(1, Vector3::new(low - 7000.0, 0.0, 0.0), Vector3::new(0.0, 7.5, 0.0), 800.0),
+            colliding_object(
+                2,
+                Vector3::new(low - 7000.0, 0.002, 0.0),
+                Vector3::new(0.0, -7.0, 1.0),
+                400.0,
+            ),
+        ]);
+        let mass_before = total_mass(&state);
+        let report = state.step(
+            1.0,
+            &FragmentationConfig::default(),
+            &mut StdRng::seed_from_u64(6),
+        );
+
+        assert_eq!(report.breakups.len(), 1, "the fixture did not collide");
+        assert!(report.fragments_created > 0);
+        assert_eq!(
+            report.reentries.len(),
+            report.fragments_created,
+            "fragments born below the floor were left in the catalog"
+        );
+        assert!(state.is_empty());
+
+        let mass_reentered: f64 = state.reentries().iter().map(|r| r.object.mass).sum();
+        assert_relative_eq!(mass_reentered, mass_before, epsilon = 1e-9);
     }
 }

@@ -29,21 +29,6 @@
 //! real close approaches near a chord's midpoint and manufacture false ones by
 //! shortcutting curvature. With hard-body radii on the order of meters, this
 //! bounds how large `dt` can be before detection quality degrades.
-//!
-//! # Potential steps forward
-//!
-//! - **Sub-sample the arc:** split each step into `k` shorter chords (propagate
-//!   at `dt/k`) so the sag falls by `~1/k^2`; adapt `k` to the step size or to
-//!   each object's swept angle.
-//! - **Higher-order paths:** interpolate with the sampled velocity (Hermite /
-//!   quadratic in `s`) instead of a straight line, then minimize the resulting
-//!   quartic in `s` numerically.
-//! - **Conjunction screening:** apply a cheap pre-filter (e.g. orbit-geometry
-//!   or bounding-volume tests) so only plausibly-close pairs reach the
-//!   narrow-phase geometry, which also pairs naturally with a spatial broad
-//!   phase.
-//! - **Error-bounded stepping:** choose `dt` (or a per-pair refinement) from an
-//!   acceptable sag tolerance so accuracy is controlled rather than implicit.
 
 use nalgebra::Vector3;
 

@@ -88,50 +88,35 @@ pub struct FragmentationConfig {
 }
 
 impl Default for FragmentationConfig {
-    /// Defaults tuned for a generic LEO population. They are deliberately
-    /// order-of-magnitude choices, not calibrated constants — the goal is
-    /// plausible cascade behavior at interactive speed, and every field is
-    /// exposed for experiments to sweep.
+    /// Order-of-magnitude choices for a generic LEO population, not calibrated
+    /// constants.
     ///
-    /// A reference point used below: two ~500 kg objects at a 10 km/s relative
-    /// speed give a reduced mass `mu = 250 kg` and `E_cm ~ 1.25e10 J`.
+    /// Reference collision for the values below: two ~500 kg objects at 10 km/s
+    /// relative speed, giving `mu = 250 kg` and `E_cm ~ 1.25e10 J`.
     fn default() -> Self {
         Self {
-            // Real hypervelocity impacts convert only a small fraction of the
-            // impact energy into fragment *translational* KE (most goes to
-            // heat, deformation, and comminution). 0.1 keeps ejecta speeds
-            // physically modest (hundreds of m/s) while still dispersing the
-            // cloud enough to seed secondary collisions.
+            // Most impact energy goes to heat and deformation, not fragment KE.
+            // 0.1 keeps ejecta at a few hundred m/s.
             energy_efficiency: 0.1,
-            // Chosen with reference_energy_joules so the reference collision
-            // above yields a few dozen fragments: (1.25e10/1e9)^0.75 ~ 6.6,
-            // times 5.0 ~ 33. Sets the overall scale of the count power law.
+            // The reference collision gives (1.25e10/1e9)^0.75 ~ 6.6, so 5.0
+            // yields ~33 fragments.
             count_coefficient: 5.0,
-            // ~0.75 borrows the sub-linear power-law exponent from the NASA
-            // Standard Breakup Model (where it applies to mass); we apply it to
-            // energy instead, so larger collisions make disproportionately more
-            // (but not linearly more) debris. See the module-level References.
+            // NASA's sub-linear exponent, applied to energy rather than mass.
+            // See the module-level References.
             count_exponent: 0.75,
-            // Normalizer for the count law: ~1 GJ is a moderate LEO impact, so
-            // count_coefficient reads directly as "fragments per moderate hit."
+            // ~1 GJ is a moderate LEO impact, so count_coefficient reads as
+            // "fragments per moderate hit".
             reference_energy_joules: 1.0e9,
-            // A collision must yield at least a pair, even in the degenerate
-            // near-zero-energy case, so the parents are always replaced.
+            // Even a zero-energy breakup must replace its parents.
             min_fragments: 2,
-            // Real catastrophic breakups can shed thousands of trackable
-            // pieces; we cap at 1000 to bound catalog growth and keep the
-            // O(n^2) broad phase fast. Raise this once a spatial broad phase
-            // lands and more realism is wanted.
+            // Real breakups shed more; this bounds catalog growth for the
+            // O(n^2) broad phase.
             max_fragments: 1000,
-            // Pareto shape for the fragment-mass tail. ~1.6 gives a heavy but
-            // finite-variance tail (a few large fragments retain most of the
-            // mass, with a long tail of small debris), qualitatively matching
-            // observed breakup size distributions.
+            // Heavy but finite-variance tail: a few large fragments hold most
+            // of the mass.
             mass_pareto_shape: 1.6,
-            // Numerical dispersal radius (100 m): far larger than the meter-
-            // scale hard-body radii (so freshly-created, otherwise co-located
-            // fragments don't self-collide on the next step) yet negligible
-            // against orbital length scales (thousands of km).
+            // 100 m: above the meter-scale hard-body radii so fresh fragments
+            // don't self-collide, far below orbital scales.
             cloud_radius_km: 0.1,
         }
     }
